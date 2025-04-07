@@ -1,7 +1,9 @@
 import React from 'react';
 import { Upload, X, Table as TableIcon, ChevronLeft, ChevronRight, Download } from 'lucide-react';
 import Papa from 'papaparse';
+import ExcelJS from 'exceljs';
 import * as XLSX from 'xlsx';
+import JSZip from 'jszip';
 import { DBService, FileData } from './services/db';
 
 const db = new DBService();
@@ -15,11 +17,16 @@ function App() {
   const [activeTab, setActiveTab] = React.useState<TabType>('de');
   const [isProcessed, setIsProcessed] = React.useState(false);
   const [currentPage, setCurrentPage] = React.useState(1);
-  const rowsPerPage = 3;
+  const rowsPerPage = 25;
   const [dbInitialized, setDbInitialized] = React.useState(false);
   const tabsRef = React.useRef<HTMLDivElement>(null);
   const [mergedData, setMergedData] = React.useState<any[] | null>(null);
   const [isMerged, setIsMerged] = React.useState(false);
+  const [isExtracting, setIsExtracting] = React.useState(false);
+  const [translatedFiles, setTranslatedFiles] = React.useState<{[key: string]: any[]}>({});
+  const [isReplacingColumns, setIsReplacingColumns] = React.useState(false);
+  const [translatedMergedData, setTranslatedMergedData] = React.useState<any[] | null>(null);
+  const translatedColumnsRef = React.useRef<HTMLDivElement>(null);
 
   const normalizeSKU = (sku: string): string => {
     if (!sku) return '';
@@ -243,7 +250,7 @@ function App() {
     document.body.removeChild(link);
   };
 
-  const downloadXLSX = (data: any[]) => {
+  const downloadXLSX = async (data: any[]) => {
     try {
       // Clean the data to ensure it's properly serializable
       const cleanData = data.map(row => {
@@ -261,13 +268,24 @@ function App() {
         return cleanRow;
       });
       
-      const worksheet = XLSX.utils.json_to_sheet(cleanData);
-      const workbook = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(workbook, worksheet, 'Data');
+      // Create a new workbook using ExcelJS
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet('Data');
       
-      // Use buffer-based approach for more consistent results
-      const wbout = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
-      const blob = new Blob([wbout], { type: 'application/octet-stream' });
+      // Add headers
+      if (cleanData.length > 0) {
+        const headers = Object.keys(cleanData[0]);
+        worksheet.columns = headers.map(header => ({ header, key: header }));
+        
+        // Add rows
+        cleanData.forEach(row => {
+          worksheet.addRow(row);
+        });
+      }
+      
+      // Generate buffer using ExcelJS
+      const buffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
       
       // Create download link
       const url = URL.createObjectURL(blob);
@@ -279,9 +297,23 @@ function App() {
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
     } catch (error) {
-      console.error('Error exporting to XLSX:', error);
+      console.error('Error exporting to XLSX with ExcelJS:', error);
       alert('Error exporting to XLSX. Trying downloading as CSV instead.');
     }
+  };
+
+  const handleClear = () => {
+    // Clear all states
+    setDeFile(null);
+    setProductFile(null);
+    setIsProcessed(false);
+    setMergedData(null);
+    setIsMerged(false);
+    setCurrentPage(1);
+    
+    // Clear storage
+    db.deleteFile('deFile');
+    db.deleteFile('productFile');
   };
 
   React.useEffect(() => {
@@ -335,26 +367,6 @@ function App() {
     setCurrentPage(page);
   };
 
-  const handleClear = () => {
-    setDeFile(null);
-    setProductFile(null);
-    setIsProcessed(false);
-    setIsMerged(false);
-    setMergedData(null);
-    setCurrentPage(1);
-    
-    // Clear file inputs
-    const deInput = document.getElementById('de-file') as HTMLInputElement;
-    const productInput = document.getElementById('product-file') as HTMLInputElement;
-    
-    if (deInput) deInput.value = '';
-    if (productInput) productInput.value = '';
-    
-    // Clear database
-    db.deleteFile('deFile');
-    db.deleteFile('productFile');
-  };
-
   const parseFile = async (file: File): Promise<any[]> => {
     const fileType = file.name.split('.').pop()?.toLowerCase() || '';
     
@@ -382,16 +394,61 @@ function App() {
       const reader = new FileReader();
       reader.onload = (e) => {
         try {
-          const data = e.target?.result;
-          const workbook = XLSX.read(data, { type: 'binary' });
-          const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-          const jsonData = XLSX.utils.sheet_to_json(firstSheet);
-          resolve(jsonData);
-        } catch (error) {
-          reject(error);
+          const buffer = e.target?.result;
+          if (!buffer) {
+            throw new Error('Failed to read file buffer.');
+          }
+
+          console.log(`Attempting to parse workbook with SheetJS: ${file.name}`);
+          const workbook = XLSX.read(buffer, { type: 'array' });
+          
+          // Get the first sheet name
+          const firstSheetName = workbook.SheetNames[0];
+          if (!firstSheetName) {
+            throw new Error('No worksheet found in the Excel file.');
+          }
+          const worksheet = workbook.Sheets[firstSheetName];
+          console.log(`Using worksheet: ${firstSheetName}`);
+
+          // Convert sheet to JSON
+          // header: 1 tells SheetJS to use the first row as headers
+          // defval: '' ensures empty cells become empty strings
+          const jsonData: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
+
+          if (jsonData.length === 0) {
+            console.log(`Parsed 0 rows (empty sheet) from ${file.name}`);
+            resolve([]);
+            return;
+          }
+
+          // Convert array of arrays to array of objects
+          const headers: string[] = jsonData[0] as string[];
+          const data = jsonData.slice(1).map((rowArray: any[]) => {
+            const rowData: { [key: string]: any } = {};
+            headers.forEach((header, index) => {
+              rowData[header] = rowArray[index];
+            });
+            return rowData;
+          });
+
+          console.log(`Parsed ${data.length} data rows with SheetJS from ${file.name}`);
+          resolve(data);
+
+        } catch (error: any) {
+          console.error(`Error parsing Excel file ${file.name} with SheetJS:`, error);
+          if (error instanceof Error) {
+            reject(new Error(`Error parsing Excel file ${file.name} with SheetJS: ${error.message}`));
+          } else {
+            reject(new Error(`An unknown error occurred while parsing Excel file ${file.name} with SheetJS.`));
+          }
         }
       };
-      reader.readAsBinaryString(file);
+      reader.onerror = (error) => {
+        console.error(`FileReader error for file ${file.name}:`, error);
+        reject(new Error(`FileReader failed for ${file.name}.`));
+      };
+      // Use readAsArrayBuffer for SheetJS
+      reader.readAsArrayBuffer(file);
     });
   };
 
@@ -446,7 +503,7 @@ function App() {
     } as FileData);
   };
 
-  const renderTable = (data: any[] | undefined | null) => {
+  const renderTable = (data: any[] | undefined | null, showActionButtons = true) => {
     if (!data || data.length === 0) return null;
     
     const totalPages = Math.ceil(data.length / rowsPerPage);
@@ -585,8 +642,8 @@ function App() {
           </div>
         </div>
 
-        {/* Add Merge Files and Download Buttons */}
-        {activeTab !== 'merged' && isProcessed && !isMerged && (
+        {/* Add Merge Files and Download Buttons - Conditionally render based on prop */} 
+        {showActionButtons && activeTab !== 'merged' && isProcessed && !isMerged && (
           <div className="mt-4 flex justify-center">
             <button
               onClick={mergeFiles}
@@ -597,26 +654,288 @@ function App() {
           </div>
         )}
         
-        {activeTab === 'merged' && mergedData && mergedData.length > 0 && (
+        {showActionButtons && activeTab === 'merged' && mergedData && mergedData.length > 0 && (
           <div className="flex flex-wrap gap-4 mt-4 justify-end">
             <button
-              onClick={() => downloadCSV(mergedData)}
-              className="flex items-center gap-2 py-2 px-4 rounded-lg font-medium bg-green-600 hover:bg-green-700 text-white transition-colors"
+              onClick={() => extractColumns(mergedData)}
+              disabled={isExtracting}
+              className={`flex items-center gap-2 py-2 px-4 rounded-lg font-medium transition-colors ${
+                isMerged && !isExtracting
+                  ? 'bg-green-600 hover:bg-green-700 text-white'
+                  : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+              }`}
             >
               <Download className="w-4 h-4" />
-              Download CSV
-            </button>
-            <button
-              onClick={() => downloadXLSX(mergedData)}
-              className="flex items-center gap-2 py-2 px-4 rounded-lg font-medium bg-green-600 hover:bg-green-700 text-white transition-colors"
-            >
-              <Download className="w-4 h-4" />
-              Download XLSX
+              {isExtracting ? 'Extracting...' : 'Extract Columns'}
             </button>
           </div>
         )}
       </div>
     );
+  };
+
+  const extractColumns = async (data: any[]) => {
+    if (!data || data.length === 0) {
+      alert('No data available to extract');
+      return;
+    }
+
+    setIsExtracting(true);
+    
+    try {
+      const columnsToExtract = ['Subcategory', 'Category', 'Title', 'description'];
+      const availableColumns = Object.keys(data[0]);
+      
+      // Check if all required columns exist
+      const missingColumns = columnsToExtract.filter(col => !availableColumns.includes(col));
+      if (missingColumns.length > 0) {
+        alert(`The following columns are missing: ${missingColumns.join(', ')}`);
+        return;
+      }
+      
+      // Create a new ZIP file
+      const zip = new JSZip();
+      
+      // Add each column's data to the ZIP
+      for (const column of columnsToExtract) {
+        try {
+          // Handle description column differently - split into multiple files
+          if (column === 'description') {
+            // Chunk size for description column (600 rows per file)
+            const ROWS_PER_FILE = 600;
+            const totalChunks = Math.ceil(data.length / ROWS_PER_FILE);
+            
+            for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+              // Calculate chunk start and end
+              const start = chunkIndex * ROWS_PER_FILE;
+              const end = Math.min(start + ROWS_PER_FILE, data.length);
+              const chunk = data.slice(start, end);
+              
+              // Create a new workbook for this chunk
+              const workbook = new ExcelJS.Workbook();
+              const worksheet = workbook.addWorksheet('Data');
+              
+              // Add headers (include SKU and index as identifiers)
+              worksheet.columns = [
+                { header: 'row_index', key: 'row_index' },
+                { header: 'SKU', key: 'SKU' },
+                { header: column, key: column }
+              ];
+              
+              // Add rows with identifiers
+              chunk.forEach((row, localIndex) => {
+                const globalIndex = start + localIndex; // Original index in full dataset
+                worksheet.addRow({
+                  row_index: globalIndex,
+                  SKU: row.SKU || '',
+                  [column]: row[column] || ''
+                });
+              });
+              
+              // Generate buffer
+              const buffer = await workbook.xlsx.writeBuffer();
+              zip.file(`${column.toLowerCase()}_${chunkIndex + 1}_of_${totalChunks}.xlsx`, buffer);
+            }
+          } else {
+            // Handle other columns normally
+            const extractedData = data.map((row, index) => ({
+              row_index: index,
+              SKU: row.SKU || '',
+              [column]: row[column] || ''
+            }));
+            
+            // Create a new workbook for each column
+            const workbook = new ExcelJS.Workbook();
+            const worksheet = workbook.addWorksheet('Data');
+            
+            // Add header
+            worksheet.columns = [
+              { header: 'row_index', key: 'row_index' },
+              { header: 'SKU', key: 'SKU' },
+              { header: column, key: column }
+            ];
+            
+            // Add rows
+            extractedData.forEach(row => {
+              worksheet.addRow(row);
+            });
+            
+            // Generate buffer
+            const buffer = await workbook.xlsx.writeBuffer();
+            zip.file(`${column.toLowerCase()}.xlsx`, buffer);
+          }
+        } catch (error) {
+          console.error(`Error processing ${column}:`, error);
+        }
+      }
+      
+      // Generate and download the ZIP file
+      const zipBlob = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(zipBlob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'extracted_columns.zip';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      
+      // alert('All columns have been successfully extracted to a ZIP file!');
+    } catch (error) {
+      console.error('Error during extraction:', error);
+      alert('An error occurred during extraction. Please try again.');
+    } finally {
+      setIsExtracting(false);
+    }
+  };
+
+  const handleTranslatedFileChange = async (event: React.ChangeEvent<HTMLInputElement>, columnName: string) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+
+    try {
+      setIsLoading(true);
+      let allRows: any[] = [];
+
+      // Process all selected files
+      for (let i = 0; i < files.length; i++) {
+        const fileData = await parseExcelFile(files[i]); // Parses using actual headers in file
+        
+        // --- Data Standardization Step --- 
+        const standardizedData = fileData.map(row => {
+          const keys = Object.keys(row);
+          // Expecting 3 columns from export: row_index, SKU, dataColumn
+          if (keys.length < 3) {
+            console.warn(`Skipping row with unexpected column count in ${files[i].name}:`, row);
+            return null; // Skip rows that don't match expected structure
+          }
+          
+          // Find the data column key (the one that isn't 'row_index' or 'SKU')
+          // We assume the keys might be translated, so we find the one that remains.
+          let dataKey = keys.find(key => 
+            key.toLowerCase() !== 'row_index' && key.toLowerCase() !== 'sku'
+          );
+
+          if (!dataKey) {
+            // Fallback if keys are exactly row_index/SKU (e.g., only identifiers exist)
+            // Or if the structure is completely unexpected, try index 2 as last resort
+            if (keys.length >= 3) dataKey = keys[2]; 
+            else { 
+              console.warn(`Could not identify data column key in ${files[i].name}:`, row);
+              return null;
+            }
+          }
+          
+          const rowIndex = row['row_index'] ?? row[keys.find(k => k.toLowerCase() === 'row_index') ?? ''];
+          const sku = row['SKU'] ?? row[keys.find(k => k.toLowerCase() === 'sku') ?? ''];
+
+          // Return standardized object with original columnName as the key
+          return {
+            row_index: rowIndex,
+            SKU: sku,
+            [columnName]: row[dataKey] // Use original name here
+          };
+        }).filter(row => row !== null); // Remove any skipped rows
+        // --- End Standardization ---
+
+        allRows = [...allRows, ...standardizedData];
+      }
+
+      // Sort combined data if multiple files were processed (primarily for description chunks)
+      if (files.length > 1) {
+        allRows.sort((a, b) => {
+          const indexA = typeof a.row_index === 'string' ? parseInt(a.row_index, 10) : a.row_index;
+          const indexB = typeof b.row_index === 'string' ? parseInt(b.row_index, 10) : b.row_index;
+          // Handle potential NaN during sort
+          return (isNaN(indexA) ? Infinity : indexA) - (isNaN(indexB) ? Infinity : indexB);
+        });
+      }
+
+      setTranslatedFiles(prev => ({
+        ...prev,
+        [columnName]: allRows
+      }));
+
+      // Show success message
+      const fileCount = files.length;
+      const message = fileCount > 1
+        ? `Successfully loaded and processed ${fileCount} files for ${columnName} with ${allRows.length} total rows.`
+        : `Successfully loaded and processed ${files[0].name} with ${allRows.length} rows.`;
+      alert(message);
+
+    } catch (error) {
+      console.error(`Error processing translated ${columnName} files:`, error);
+      alert(`Error processing translated ${columnName} files. Please check the console for details.`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const replaceColumnsWithTranslations = () => {
+    if (!mergedData) {
+      alert('Original merged data is not available.');
+      return;
+    }
+    if (Object.keys(translatedFiles).length === 0) {
+      alert('Please upload at least one translated file.');
+      return;
+    }
+
+    setIsReplacingColumns(true);
+
+    try {
+      // Create a deep copy to avoid modifying the original mergedData
+      const updatedData = JSON.parse(JSON.stringify(mergedData));
+      const columnsToReplace = Object.keys(translatedFiles);
+
+      columnsToReplace.forEach(columnName => {
+        const translatedColumnData = translatedFiles[columnName];
+
+        // Create a map from row index to translated value
+        const translationMap = new Map();
+        translatedColumnData.forEach(row => {
+          if (row[columnName] !== undefined && row.row_index !== undefined) {
+            const rowIndex = typeof row.row_index === 'string'
+              ? parseInt(row.row_index, 10)
+              : row.row_index;
+
+            // Handle potential NaN from parseInt
+            if (!isNaN(rowIndex)) {
+              translationMap.set(rowIndex, row[columnName]);
+            } else {
+              console.warn(`Skipping row with invalid row_index: ${row.row_index} for column ${columnName}`);
+            }
+          }
+        });
+
+        // Replace values in the copied data
+        updatedData.forEach((row: any, index: number) => {
+          if (translationMap.has(index)) {
+            row[columnName] = translationMap.get(index);
+          }
+        });
+      });
+
+      // Set the new state with the translated data
+      setTranslatedMergedData(updatedData);
+
+      // Clear the uploaded translated files
+      setTranslatedFiles({});
+
+      // Reset file input elements
+      document.querySelectorAll('input[type="file"].translated-file-input').forEach((input) => {
+        (input as HTMLInputElement).value = '';
+      });
+
+      alert('Translated data generated successfully! See the new table below.');
+
+    } catch (error) {
+      console.error('Error applying translations:', error);
+      alert('Error applying translations to create new table.');
+      setTranslatedMergedData(null); // Clear potentially partial data on error
+    } finally {
+      setIsReplacingColumns(false);
+    }
   };
 
   return (
@@ -738,7 +1057,6 @@ function App() {
               </div>
             </div>
           </div>
-
         </div>
 
         <div className="mt-6 flex justify-center">
@@ -811,6 +1129,98 @@ function App() {
                   : mergedData && renderTable(mergedData)
               }
             </div>
+          </div>
+        )}
+
+        {/* Translation imports section */}
+        {isMerged && mergedData && mergedData.length > 0 && (
+          <div className="mt-8 border-t border-gray-200 pt-6" ref={translatedColumnsRef}>
+            <h3 className="text-lg font-medium text-gray-900 mb-4">Import Translated Columns</h3>
+            <p className="text-sm text-gray-500 mb-4">
+              Upload your translated Excel files to replace the original columns in the merged data.
+              Each file should have the same structure as the exported column files.
+            </p>
+            
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+              {['Subcategory', 'Category', 'Title', 'description'].map((column) => (
+                <div key={column} className="border rounded-lg p-4">
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    {column} (Translated)
+                    {column === 'description' && (
+                      <span className="ml-2 text-xs text-gray-500">(Multiple files allowed)</span>
+                    )}
+                  </label>
+                  <div className={`border-2 border-dashed rounded-lg p-4 transition-colors ${
+                    translatedFiles[column] ? 'border-green-400 bg-green-50' : 'border-gray-300 hover:border-blue-400'
+                  } cursor-pointer`}
+                  onClick={() => document.getElementById(`translated-${column.toLowerCase()}`)?.click()}>
+                    <div className="flex flex-col items-center">
+                      <Upload className={`w-8 h-8 mb-2 ${
+                        translatedFiles[column] ? 'text-green-500' : 'text-gray-400'
+                      }`} />
+                      <input
+                        type="file"
+                        accept=".xlsx"
+                        multiple={column === 'description'}
+                        onChange={(e) => handleTranslatedFileChange(e, column)}
+                        className="hidden translated-file-input"
+                        id={`translated-${column.toLowerCase()}`}
+                      />
+                      <label htmlFor={`translated-${column.toLowerCase()}`} className="text-sm text-center">
+                        {translatedFiles[column] ? (
+                          <p className="font-medium text-green-600">
+                            {translatedFiles[column].length} rows loaded
+                          </p>
+                        ) : (
+                          <p className="font-medium text-gray-700">
+                            Upload translated {column}
+                            {column === 'description' && (
+                              <span className="block text-xs text-gray-500 mt-1">
+                                Select all description_*.xlsx files
+                              </span>
+                            )}
+                          </p>
+                        )}
+                      </label>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            
+            <div className="mt-6 flex justify-center">
+              <button
+                onClick={replaceColumnsWithTranslations}
+                disabled={Object.keys(translatedFiles).length === 0 || isReplacingColumns}
+                className={`py-3 px-8 rounded-lg font-medium transition-colors ${
+                  Object.keys(translatedFiles).length > 0 && !isReplacingColumns
+                    ? 'bg-purple-600 hover:bg-purple-700 text-white'
+                    : 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                }`}
+              >
+                {isReplacingColumns ? 'Generating Table...' : 'Generate Table with Translations'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* New Section: Display Translated Merged Table */} 
+        {translatedMergedData && (
+          <div className="mt-12 border-t border-gray-200 pt-6">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-xl font-semibold text-gray-900">
+                Generated Table with Translations
+              </h3>
+              <button
+                onClick={() => downloadXLSX(translatedMergedData)}
+                className="flex items-center gap-2 py-2 px-4 rounded-lg font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors"
+              >
+                <Download className="w-4 h-4" />
+                Download Translated Table (XLSX)
+              </button>
+            </div>
+            {/* Render the table, passing false to hide action buttons */} 
+            {renderTable(translatedMergedData, false)}
           </div>
         )}
       </div>
