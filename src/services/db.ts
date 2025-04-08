@@ -3,7 +3,7 @@ const DB_VERSION = 1;
 const STORE_NAME = 'files';
 
 export interface FileData {
-  id: 'deFile' | 'productFile';
+  id: 'deFile' | 'productFile' | 'mergedData';
   name: string;
   type: string;
   size: number;

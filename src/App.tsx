@@ -27,6 +27,17 @@ function App() {
   const [isReplacingColumns, setIsReplacingColumns] = React.useState(false);
   const [translatedMergedData, setTranslatedMergedData] = React.useState<any[] | null>(null);
   const translatedColumnsRef = React.useRef<HTMLDivElement>(null);
+  const [notification, setNotification] = React.useState<{
+    message: string;
+    type: 'success' | 'error' | 'info';
+  } | null>(null);
+
+  // Helper function to show notifications
+  const showNotification = React.useCallback((message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    setNotification({ message, type });
+    // Auto-hide notification after 5 seconds
+    setTimeout(() => setNotification(null), 5000);
+  }, []);
 
   const normalizeSKU = (sku: string): string => {
     if (!sku) return '';
@@ -232,7 +243,6 @@ function App() {
       
     } catch (error) {
       console.error('Error merging files:', error);
-      alert('Error merging files. Please check the file structure and try again.');
     } finally {
       setIsLoading(false);
     }
@@ -298,7 +308,6 @@ function App() {
       URL.revokeObjectURL(url);
     } catch (error) {
       console.error('Error exporting to XLSX with ExcelJS:', error);
-      alert('Error exporting to XLSX. Trying downloading as CSV instead.');
     }
   };
 
@@ -314,6 +323,7 @@ function App() {
     // Clear storage
     db.deleteFile('deFile');
     db.deleteFile('productFile');
+    db.deleteFile('mergedData');
   };
 
   React.useEffect(() => {
@@ -337,9 +347,14 @@ function App() {
       try {
         const savedDeFile = await db.getFile('deFile');
         const savedProductFile = await db.getFile('productFile');
+        const savedMergedData = await db.getFile('mergedData');
 
         if (savedDeFile) setDeFile(savedDeFile);
         if (savedProductFile) setProductFile(savedProductFile);
+        if (savedMergedData) {
+          setMergedData(savedMergedData.content || null);
+          setIsMerged(true);
+        }
 
         if (savedDeFile && savedProductFile) {
           setIsProcessed(true);
@@ -356,12 +371,21 @@ function App() {
     const updateDB = async () => {
       if (deFile) await db.saveFile(deFile);
       if (productFile) await db.saveFile(productFile);
+      if (mergedData) {
+        await db.saveFile({
+          id: 'mergedData',
+          name: 'merged_data',
+          type: 'json',
+          size: 0,
+          content: mergedData
+        });
+      }
     };
 
     if (dbInitialized) {
       updateDB();
     }
-  }, [deFile, productFile, dbInitialized]);
+  }, [deFile, productFile, mergedData, dbInitialized]);
 
   const handlePageChange = (page: number) => {
     setCurrentPage(page);
@@ -410,25 +434,12 @@ function App() {
           const worksheet = workbook.Sheets[firstSheetName];
           console.log(`Using worksheet: ${firstSheetName}`);
 
-          // Convert sheet to JSON
-          // header: 1 tells SheetJS to use the first row as headers
-          // defval: '' ensures empty cells become empty strings
-          const jsonData: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
-
-          if (jsonData.length === 0) {
-            console.log(`Parsed 0 rows (empty sheet) from ${file.name}`);
-            resolve([]);
-            return;
-          }
-
-          // Convert array of arrays to array of objects
-          const headers: string[] = jsonData[0] as string[];
-          const data = jsonData.slice(1).map((rowArray: any[]) => {
-            const rowData: { [key: string]: any } = {};
-            headers.forEach((header, index) => {
-              rowData[header] = rowArray[index];
-            });
-            return rowData;
+          // Convert sheet to JSON with headers option
+          // This will automatically use the first row as headers and return objects
+          const data = XLSX.utils.sheet_to_json(worksheet, { 
+            defval: '', // Empty cells become empty strings
+            raw: false, // Convert all numbers to strings
+            blankrows: false // Skip blank rows
           });
 
           console.log(`Parsed ${data.length} data rows with SheetJS from ${file.name}`);
@@ -473,7 +484,6 @@ function App() {
       }
     } catch (error) {
       console.error('Error processing files:', error);
-      alert('Error processing files. Please make sure they are valid CSV files.');
     } finally {
       setIsLoading(false);
     }
@@ -490,7 +500,6 @@ function App() {
     const allowedTypes = ['csv', 'xls', 'xlsx'];
 
     if (!allowedTypes.includes(fileType)) {
-      alert('Please upload only CSV, XLS, or XLSX files');
       event.target.value = '';
       return;
     }
@@ -676,7 +685,6 @@ function App() {
 
   const extractColumns = async (data: any[]) => {
     if (!data || data.length === 0) {
-      alert('No data available to extract');
       return;
     }
 
@@ -689,7 +697,6 @@ function App() {
       // Check if all required columns exist
       const missingColumns = columnsToExtract.filter(col => !availableColumns.includes(col));
       if (missingColumns.length > 0) {
-        alert(`The following columns are missing: ${missingColumns.join(', ')}`);
         return;
       }
       
@@ -780,10 +787,8 @@ function App() {
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
       
-      // alert('All columns have been successfully extracted to a ZIP file!');
     } catch (error) {
       console.error('Error during extraction:', error);
-      alert('An error occurred during extraction. Please try again.');
     } finally {
       setIsExtracting(false);
     }
@@ -793,79 +798,113 @@ function App() {
     const files = event.target.files;
     if (!files || files.length === 0) return;
 
+    // Define column header translations for each language
+    const columnTranslations = {
+      'Subcategory': ['subkategorija', 'underkategori', 'underkategori', 'alaluokka', 'underkategori'],
+      'Category': ['kategorija', 'kategori', 'kategori', 'luokka', 'kategori'],
+      'Title': ['pavadinimas', 'titel', 'titel', 'otsikko', 'tittel'],
+      'description': ['aprašymas', 'Beskrivning', 'beskrivelse', 'kuvaus', 'beskrivelse']
+    };
+
     try {
       setIsLoading(true);
       let allRows: any[] = [];
+      let skippedRows = 0;
 
       // Process all selected files
       for (let i = 0; i < files.length; i++) {
-        const fileData = await parseExcelFile(files[i]); // Parses using actual headers in file
+        const fileData = await parseExcelFile(files[i]);
         
-        // --- Data Standardization Step --- 
+        // --- Improved Data Standardization Step --- 
         const standardizedData = fileData.map(row => {
           const keys = Object.keys(row);
-          // Expecting 3 columns from export: row_index, SKU, dataColumn
-          if (keys.length < 3) {
-            console.warn(`Skipping row with unexpected column count in ${files[i].name}:`, row);
-            return null; // Skip rows that don't match expected structure
-          }
           
-          // Find the data column key (the one that isn't 'row_index' or 'SKU')
-          // We assume the keys might be translated, so we find the one that remains.
-          let dataKey = keys.find(key => 
-            key.toLowerCase() !== 'row_index' && key.toLowerCase() !== 'sku'
-          );
+          // Find row_index and SKU columns (these should remain in English)
+          const rowIndexKey = keys.find(k => k.toLowerCase() === 'row_index') || keys[0];
+          const skuKey = keys.find(k => k.toLowerCase() === 'sku') || keys[1];
 
-          if (!dataKey) {
-            // Fallback if keys are exactly row_index/SKU (e.g., only identifiers exist)
-            // Or if the structure is completely unexpected, try index 2 as last resort
-            if (keys.length >= 3) dataKey = keys[2]; 
-            else { 
-              console.warn(`Could not identify data column key in ${files[i].name}:`, row);
-              return null;
-            }
+          // Find the translated data column using the translations array
+          const possibleTranslations = columnTranslations[columnName as keyof typeof columnTranslations] || [];
+          const dataKey = keys.find(k => 
+            possibleTranslations.includes(k.toLowerCase()) || 
+            k.toLowerCase() === columnName.toLowerCase()
+          ) || keys[2];
+
+          // Get values using found keys
+          const rowIndex = row[rowIndexKey];
+          const sku = row[skuKey];
+          const value = row[dataKey];
+
+          // Log the mapping for debugging
+          console.log(`File ${i + 1}, Row mapping:`, {
+            foundRowIndexKey: rowIndexKey,
+            foundSkuKey: skuKey,
+            foundDataKey: dataKey,
+            availableKeys: keys,
+            value: value
+          });
+
+          // Only skip if we can't find any of the essential data
+          if (value === undefined) {
+            console.warn(`Skipping row due to missing translated value in ${files[i].name}:`, {
+              rowIndex,
+              sku,
+              value,
+              keys,
+              row
+            });
+            skippedRows++;
+            return null;
           }
-          
-          const rowIndex = row['row_index'] ?? row[keys.find(k => k.toLowerCase() === 'row_index') ?? ''];
-          const sku = row['SKU'] ?? row[keys.find(k => k.toLowerCase() === 'sku') ?? ''];
 
-          // Return standardized object with original columnName as the key
+          // Use default values for missing row_index or SKU
+          const processedRowIndex = rowIndex === undefined ? '0' : rowIndex;
+          const processedSku = sku === undefined ? '' : sku;
+
           return {
-            row_index: rowIndex,
-            SKU: sku,
-            [columnName]: row[dataKey] // Use original name here
+            row_index: processedRowIndex,
+            SKU: processedSku,
+            [columnName]: value
           };
-        }).filter(row => row !== null); // Remove any skipped rows
-        // --- End Standardization ---
+        }).filter(row => row !== null);
 
         allRows = [...allRows, ...standardizedData];
       }
 
-      // Sort combined data if multiple files were processed (primarily for description chunks)
+      // Sort combined data if multiple files were processed
       if (files.length > 1) {
         allRows.sort((a, b) => {
           const indexA = typeof a.row_index === 'string' ? parseInt(a.row_index, 10) : a.row_index;
           const indexB = typeof b.row_index === 'string' ? parseInt(b.row_index, 10) : b.row_index;
-          // Handle potential NaN during sort
           return (isNaN(indexA) ? Infinity : indexA) - (isNaN(indexB) ? Infinity : indexB);
         });
       }
 
+      // Add validation to ensure we have data
+      if (allRows.length === 0) {
+        throw new Error('No valid rows were processed. Please check the file format and column headers.');
+      }
+
+      // Create a map using SKU as the key instead of row_index
+      const rowsBySku = new Map();
+      allRows.forEach(row => {
+        if (row.SKU) {
+          rowsBySku.set(row.SKU, row);
+        }
+      });
+
       setTranslatedFiles(prev => ({
         ...prev,
-        [columnName]: allRows
+        [columnName]: Array.from(rowsBySku.values())
       }));
 
-      // Show success message
+      // Log for debugging
       const fileCount = files.length;
-      const message = fileCount > 1
-        ? `Successfully loaded and processed ${fileCount} files for ${columnName} with ${allRows.length} total rows.`
-        : `Successfully loaded and processed ${files[0].name} with ${allRows.length} rows.`;
-      alert(message);
+      const message = `Successfully processed ${fileCount} file(s) for ${columnName}.\nTotal rows: ${allRows.length}\nUnique SKUs: ${rowsBySku.size}\nSkipped rows: ${skippedRows}\nFirst few values: ${Array.from(rowsBySku.values()).slice(0, 3).map(row => row[columnName]).join(', ')}...`;
+      console.log(message);
 
     } catch (error) {
       console.error(`Error processing translated ${columnName} files:`, error);
-      alert(`Error processing translated ${columnName} files. Please check the console for details.`);
     } finally {
       setIsLoading(false);
     }
@@ -873,11 +912,9 @@ function App() {
 
   const replaceColumnsWithTranslations = () => {
     if (!mergedData) {
-      alert('Original merged data is not available.');
       return;
     }
     if (Object.keys(translatedFiles).length === 0) {
-      alert('Please upload at least one translated file.');
       return;
     }
 
@@ -888,32 +925,31 @@ function App() {
       const updatedData = JSON.parse(JSON.stringify(mergedData));
       const columnsToReplace = Object.keys(translatedFiles);
 
+      // Create a map of SKU to row for each translated column
+      const translationMaps = new Map();
       columnsToReplace.forEach(columnName => {
         const translatedColumnData = translatedFiles[columnName];
-
-        // Create a map from row index to translated value
-        const translationMap = new Map();
+        const skuMap = new Map();
+        
         translatedColumnData.forEach(row => {
-          if (row[columnName] !== undefined && row.row_index !== undefined) {
-            const rowIndex = typeof row.row_index === 'string'
-              ? parseInt(row.row_index, 10)
-              : row.row_index;
+          if (row.SKU && row[columnName] !== undefined) {
+            skuMap.set(row.SKU, row[columnName]);
+          }
+        });
+        
+        translationMaps.set(columnName, skuMap);
+      });
 
-            // Handle potential NaN from parseInt
-            if (!isNaN(rowIndex)) {
-              translationMap.set(rowIndex, row[columnName]);
-            } else {
-              console.warn(`Skipping row with invalid row_index: ${row.row_index} for column ${columnName}`);
+      // Replace values in the copied data using SKU matching
+      updatedData.forEach((row: any) => {
+        if (row.SKU) {
+          columnsToReplace.forEach(columnName => {
+            const translationMap = translationMaps.get(columnName);
+            if (translationMap && translationMap.has(row.SKU)) {
+              row[columnName] = translationMap.get(row.SKU);
             }
-          }
-        });
-
-        // Replace values in the copied data
-        updatedData.forEach((row: any, index: number) => {
-          if (translationMap.has(index)) {
-            row[columnName] = translationMap.get(index);
-          }
-        });
+          });
+        }
       });
 
       // Set the new state with the translated data
@@ -927,19 +963,31 @@ function App() {
         (input as HTMLInputElement).value = '';
       });
 
-      alert('Translated data generated successfully! See the new table below.');
-
     } catch (error) {
       console.error('Error applying translations:', error);
-      alert('Error applying translations to create new table.');
-      setTranslatedMergedData(null); // Clear potentially partial data on error
+      setTranslatedMergedData(null);
     } finally {
       setIsReplacingColumns(false);
     }
   };
 
+  const clearTranslatedTable = () => {
+    setTranslatedMergedData(null);
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50 flex items-center justify-center p-4">
+      {notification && (
+        <div
+          className={`fixed top-4 right-4 p-4 rounded-lg shadow-lg z-50 transition-all transform ${
+            notification.type === 'success' ? 'bg-green-500' :
+            notification.type === 'error' ? 'bg-red-500' :
+            'bg-blue-500'
+          } text-white`}
+        >
+          {notification.message}
+        </div>
+      )}
       {isLoading && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white rounded-lg p-6 flex flex-col items-center">
@@ -1211,13 +1259,22 @@ function App() {
               <h3 className="text-xl font-semibold text-gray-900">
                 Generated Table with Translations
               </h3>
-              <button
-                onClick={() => downloadXLSX(translatedMergedData)}
-                className="flex items-center gap-2 py-2 px-4 rounded-lg font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors"
-              >
-                <Download className="w-4 h-4" />
-                Download Translated Table (XLSX)
-              </button>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => downloadXLSX(translatedMergedData)}
+                  className="flex items-center gap-2 py-2 px-4 rounded-lg font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors"
+                >
+                  <Download className="w-4 h-4" />
+                  Download Translated Table (XLSX)
+                </button>
+                <button
+                  onClick={clearTranslatedTable}
+                  className="flex items-center gap-2 py-2 px-4 rounded-lg font-medium bg-red-600 hover:bg-red-700 text-white transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                  Clear Translated Table
+                </button>
+              </div>
             </div>
             {/* Render the table, passing false to hide action buttons */} 
             {renderTable(translatedMergedData, false)}
